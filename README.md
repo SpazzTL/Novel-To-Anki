@@ -26,3 +26,5 @@ A folder named **cache** will be generated to load dictionaries faster.
 
 A folder named **output** will be generated to store the output.
 
+# Speed up:
+run `pip install orjson'
