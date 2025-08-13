@@ -28,3 +28,8 @@ A folder named **output** will be generated to store the output.
 
 # Speed up:
 run `pip install orjson`
+
+
+# Anki Formatting 
+A .apkg is attached with styling info
+<img width="899" height="730" alt="image" src="https://github.com/user-attachments/assets/1f272170-8d6f-42a0-aeb7-ac730db7ce54" />
