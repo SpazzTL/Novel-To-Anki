@@ -7,7 +7,7 @@ Inspects webnovels in .epub and .txt format and outputs a CSV file for Anki.
 ---
 
 # How to use:
-Place the script in a folder with the EPUB | TXT files you want to parse. Create a folder named **Dictionaries** and place zipped dictionaries inside it.
+Place the script in a folder with the EPUB | TXT files you want to parse. Create a folder named **Dictionaries** and place zipped (yomitan!) dictionaries inside it.
 (You can also have a folder called `novels` or `input` with all txt / epubs.)
 
 [Example Dictionaries](https://github.com/Lyroxide/yomitan-ko-dic/releases)
