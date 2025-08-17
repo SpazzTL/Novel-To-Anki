@@ -33,3 +33,4 @@ run `pip install orjson`
 # Anki Formatting 
 A .apkg is attached with styling info
 <img width="899" height="730" alt="image" src="https://github.com/user-attachments/assets/1f272170-8d6f-42a0-aeb7-ac730db7ce54" />
+<img width="930" height="488" alt="image" src="https://github.com/user-attachments/assets/8e62c5c4-f63b-4757-915b-d8b92b730207" />
