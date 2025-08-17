@@ -1,420 +1,541 @@
-import json
-import re
-import os
 import csv
-from collections import Counter
+import os
+import pickle
+import re
+import sys
+import zipfile
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from glob import glob
+from typing import Any, Dict, List, Tuple
+
 import ebooklib
 from ebooklib import epub
-from konlpy.tag import Okt
-import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import pickle
-import sys
-from glob import glob
-from typing import Dict, Any
 
-# --- New functions from process_anki_data.py for formatting ---
+# Use a more performant JSON library if available
+try:
+    import orjson
+except ImportError:
+    import json as orjson
+
+# --- Constants ---
+# Pre-compiled regex for speed
+CLEANR = re.compile('<.*?>|&([a-z0-9]+|#[0-9]{1,6}|#x[0-9a-f]{1,6});')
+SENTENCE_SPLITTER = re.compile(r'(?<=[.?!])\s+')
+
+# Output Directories
+DICTIONARIES_FOLDER = 'Dictionaries'
+CACHE_FOLDER = 'cache'
+ANKI_FOLDER = 'output/anki_csv'
+GRAMMAR_FOLDER = 'output/grammar_analysis'
+JSON_FOLDER = 'output/json_analysis'
+
+
 def parse_definition(definition_text: str) -> str:
     """
-    Parses the complex definition text to extract meanings and examples.
+    Parses a definition string, which can be in various JSON formats, and converts it to HTML.
+
+    Args:
+        definition_text: The raw definition string, potentially containing JSON.
+
+    Returns:
+        An HTML-formatted string representing the definition.
     """
-    html_output = '<div class="definition-content">'
-    
-    # Check if the definition text contains the complex JSON-like structure
-    if 'KRDICT-EN-hanja.v1.0.3-hanja-only' in definition_text:
-        try:
-            # Extract the relevant JSON-like part
-            json_part = re.search(r"KRDICT-EN-hanja\.v1\.0\.3-hanja-only:\s*(\[.*\])", definition_text, re.DOTALL).group(1)
-            # Fix single quotes and other JSON-incompatibilities
-            json_part = json_part.replace("'", '"').replace("`", '"')
-            data = json.loads(json_part)
-            
-            structured_content = data[0]['content']
-            
-            meaning_sections = [c for c in structured_content if isinstance(c, dict) and 'style' in c and 'fontWeight' in c['style'] and 'content' in c and c['content'].isdigit()]
-            
-            if meaning_sections:
-                for section in meaning_sections:
-                    meaning_number = section['content']
-                    meaning_index = structured_content.index(section)
-                    
-                    english_meaning = structured_content[meaning_index + 1]['content'] if meaning_index + 1 < len(structured_content) and 'content' in structured_content[meaning_index + 1] else 'No meaning found'
-                    
-                    description_text = structured_content[meaning_index + 2]['content'] if meaning_index + 2 < len(structured_content) and 'content' in structured_content[meaning_index + 2] else ''
-                    
-                    examples_list = structured_content[meaning_index + 3]['content'] if meaning_index + 3 < len(structured_content) and 'tag' in structured_content[meaning_index + 3] and structured_content[meaning_index + 3]['tag'] == 'ul' else []
-                    
-                    html_output += f'<div class="definition-section">'
-                    html_output += f'<p class="definition-meaning"><b>Meaning {meaning_number}:</b> {english_meaning}</p>'
-                    if description_text:
-                        html_output += f'<p class="definition-desc">{description_text}</p>'
-                    
-                    if examples_list:
-                        html_output += '<ul class="definition-examples">'
-                        for example in examples_list:
-                            html_output += f'<li>{example["content"]}</li>'
-                        html_output += '</ul>'
-                    html_output += '</div>'
-
-            html_output += '</div>'
-            return html_output
-
-        except (json.JSONDecodeError, IndexError, AttributeError):
-            # Fallback to plain text if parsing fails
-            return f'<div class="definition-content">{definition_text}</div>'
-    else:
-        # Fallback for simpler definitions
+    # Guard against empty or non-string input
+    if not isinstance(definition_text, str) or not definition_text.strip():
         return f'<div class="definition-content">{definition_text}</div>'
 
-# --- Existing functions from epub-anki.py (with modifications) ---
-def find_epub_files():
-    """Finds all .epub files in the current directory and returns a list."""
-    return glob('*.epub')
+    html_output = '<div class="definition-content">'
+    
+    # --- Handler 1: Simple JSON list of strings ---
+    try:
+        # Check for simple list format like: ["meaning 1", "meaning 2"]
+        data = orjson.loads(definition_text)
+        if isinstance(data, list) and all(isinstance(item, str) for item in data):
+            html_output += '<ul class="definition-examples">'
+            for meaning in data:
+                html_output += f'<li>{meaning}</li>'
+            html_output += '</ul>'
+            return html_output + '</div>'
+    except (orjson.JSONDecodeError, TypeError):
+        # Not a simple JSON list, so we move on to the next handler.
+        pass
 
-def extract_text_from_epub(epub_path):
-    """Extracts text content from an EPUB file."""
-    book = epub.read_epub(epub_path)
+    # --- Handler 2: Complex structured JSON from dictionaries ---
+    try:
+        if definition_text.strip().startswith('['):
+            # A common issue is incorrect quotes; try to fix them before parsing.
+            json_part = definition_text.replace("'", '"').replace("`", '"')
+            data = orjson.loads(json_part)
+
+            # Check for the expected complex structure: [{ "content": [...] }]
+            if isinstance(data, list) and len(data) > 0 and 'content' in data[0]:
+                structured_content = data[0]['content']
+                
+                # Find all meaning sections, marked by a number followed by a period (e.g., "1.")
+                meaning_sections_indices = [
+                    i for i, item in enumerate(structured_content)
+                    if isinstance(item, dict) and 'content' in item and isinstance(item.get('content'), list) and
+                       len(item['content']) > 0 and isinstance(item['content'][0], dict) and
+                       'content' in item['content'][0] and isinstance(item['content'][0].get('content'), str) and
+                       re.match(r'^\d+\.$', item['content'][0]['content'].strip())
+                ]
+
+                if meaning_sections_indices:
+                    for meaning_index in meaning_sections_indices:
+                        section = structured_content[meaning_index]
+                        section_content = section.get('content', [])
+
+                        # Extract parts of the definition based on their typical position
+                        meaning_number = section_content[0]['content'].strip() if len(section_content) > 0 and 'content' in section_content[0] else ''
+                        english_meaning = section_content[1]['content'].strip() if len(section_content) > 1 and 'content' in section_content[1] else 'No English meaning found.'
+                        
+                        description_text = ''
+                        examples_list = []
+                        # Look for description and examples within the section
+                        for sub_item in section_content:
+                            if sub_item.get('tag') == 'div' and sub_item.get('content'):
+                                description_text = sub_item['content']
+                            if sub_item.get('tag') == 'ul' and sub_item.get('content'):
+                                examples_list = [example['content'] for example in sub_item['content'] if 'content' in example]
+                        
+                        html_output += '<div class="definition-section">'
+                        html_output += f'<p class="definition-meaning"><b>Meaning {meaning_number}</b> {english_meaning}</p>'
+                        if description_text:
+                            html_output += f'<p class="definition-desc">{description_text}</p>'
+                        if examples_list:
+                            html_output += '<ul class="definition-examples">'
+                            for example in examples_list:
+                                html_output += f'<li>{example}</li>'
+                            html_output += '</ul>'
+                        html_output += '</div>'
+                    
+                    return html_output + '</div>' # Successfully parsed complex format
+    except (orjson.JSONDecodeError, IndexError, AttributeError, TypeError) as e:
+        # If parsing fails, we'll fall through to the default handler.
+        # print(f"DEBUG: Could not parse complex JSON definition. Error: {e}") # Uncomment for debugging
+        pass
+
+    # --- Fallback Handler: Treat as plain text ---
+    # If none of the structured parsers succeed, display the raw text.
+    return f'<div class="definition-content">{definition_text}</div>'
+
+
+def find_source_files() -> List[str]:
+    """Scans common directories for .epub and .txt files."""
+    files = []
+    for directory in ['.', 'input', 'novels']:
+        if os.path.isdir(directory):
+            files.extend(glob(os.path.join(directory, '*.epub')))
+            files.extend(glob(os.path.join(directory, '*.txt')))
+    return files
+
+
+def extract_text_from_epub(epub_path: str) -> str:
+    """Extracts all text content from an EPUB file, cleaning HTML tags."""
     text_content = []
-    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-        content = item.get_body_content().decode('utf-8', 'ignore')
-        text_content.append(clean_html(content))
-    return "".join(text_content)
+    try:
+        book = epub.read_epub(epub_path)
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            try:
+                raw_html = item.get_body_content().decode('utf-8', 'ignore')
+                text_content.append(clean_html(raw_html))
+            except Exception as e:
+                print(f"WARNING: Skipping a malformed item in '{os.path.basename(epub_path)}' due to error: {e}")
+                continue
+        return "".join(text_content)
+    except (zipfile.BadZipFile, KeyError) as e:
+        print(f"\nWARNING: Skipping corrupt or malformed EPUB file: {os.path.basename(epub_path)} (Error: {e})")
+        return ""
+    except Exception as e:
+        print(f"\nWARNING: An unexpected error occurred with file '{os.path.basename(epub_path)}': {e}")
+        return ""
 
-def clean_html(raw_html):
+
+def extract_text_from_txt(txt_path: str) -> str:
+    """Extracts text content from a .txt file."""
+    with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
+        return f.read()
+
+
+def clean_html(raw_html: str) -> str:
     """Removes HTML tags and extra whitespace from a string."""
-    cleanr = re.compile('<.*?>|&([a-z0-9]+|#[0-9]{1,6}|#x[0-9a-f]{1,6});')
-    cleantext = re.sub(cleanr, '', raw_html)
+    cleantext = re.sub(CLEANR, '', raw_html)
     return re.sub(r'\s+', ' ', cleantext).strip()
 
-def get_korean_sentences(text):
-    """Splits text into a list of Korean sentences."""
-    sentences = re.split(r'(?<=[.?!])\s+', text)
-    return [s.strip() for s in sentences if s.strip()]
 
-def analyze_sentence(okt, sentence):
-    """Analyzes a single sentence to extract words and grammar patterns."""
-    words = {}
-    grammar = []
-    try:
-        pos_tagged = okt.pos(sentence, norm=True, stem=True)
-        for word, pos in pos_tagged:
-            if pos in ['Noun', 'Verb', 'Adjective', 'Adverb'] and len(word) > 1:
-                if word not in words:
-                    words[word] = {'count': 0, 'sentences': [], 'definitions': {}}
-                words[word]['count'] += 1
-                if sentence not in words[word]['sentences']:
-                    words[word]['sentences'].append(sentence)
+def get_korean_sentences(text: str) -> List[str]:
+    """Splits a block of text into sentences."""
+    return [s.strip() for s in SENTENCE_SPLITTER.split(text) if s.strip()]
 
-            if pos not in ['Punctuation', 'Foreign']:
-                grammar.append(f"{word}/{pos}")
-    except Exception:
-        pass  # Ignore sentences that cause errors
-    return words, grammar
 
-def analyze_korean_text_threaded(text):
-    """Analyzes Korean text using multiple threads."""
-    sentences = get_korean_sentences(text)
-    words = {}
-    grammar = Counter()
-    
-    print("  Initializing NLP analyzer (Okt)...")
+def initialize_worker():
+    """Initializes the KoNLPy Okt tagger for each worker process."""
+    global okt
+    from konlpy.tag import Okt
     okt = Okt()
-    print("  Analyzer initialized. Starting threaded analysis...")
 
-    with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(analyze_sentence, okt, sentence) for sentence in sentences}
+
+def analyze_sentence_chunk(sentence_chunk: List[str]) -> Tuple[Dict[str, Dict], List[str]]:
+    """Analyzes a list of sentences to extract words and grammar patterns."""
+    words = defaultdict(lambda: {'count': 0, 'sentences': []})
+    grammar = []
+    for sentence in sentence_chunk:
+        try:
+            # norm=True (normalize), stem=True (stem words to their root)
+            pos_tagged = okt.pos(sentence, norm=True, stem=True)
+            for word, pos in pos_tagged:
+                # Filter for meaningful parts of speech and ignore single-character words
+                if pos in ['Noun', 'Verb', 'Adjective', 'Adverb'] and len(word) > 1:
+                    words[word]['count'] += 1
+                    if sentence not in words[word]['sentences']:
+                        words[word]['sentences'].append(sentence)
+                if pos not in ['Punctuation', 'Foreign']:
+                    grammar.append(f"{word}/{pos}")
+        except Exception as e:
+            # Log error but continue processing other sentences
+            print(f"\nWARNING: KoNLPy failed to process a sentence. Error: {e}")
+            pass
+    return dict(words), grammar
+
+
+def analyze_korean_text_parallel(text: str) -> Tuple[Dict[str, Dict], Counter]:
+    """
+    Analyzes a large Korean text in parallel to extract word frequencies,
+    example sentences, and grammar patterns.
+    """
+    sentences = get_korean_sentences(text)
+    words = defaultdict(lambda: {'count': 0, 'sentences': [], 'definitions': {}})
+    grammar = Counter()
+
+    # Split sentences into manageable chunks for parallel processing
+    chunk_size = 2000
+    sentence_chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
+
+    with ProcessPoolExecutor(initializer=initialize_worker) as executor:
+        futures = {executor.submit(analyze_sentence_chunk, chunk) for chunk in sentence_chunks}
         
-        for i, future in enumerate(as_completed(futures)):
-            print(f"\r  Analyzing sentences: {i + 1}/{len(sentences)}", end="")
-            
-            sentence_words, sentence_grammar = future.result()
-            for word, data in sentence_words.items():
-                if word not in words:
-                    words[word] = {'count': 0, 'sentences': [], 'definitions': {}}
-                words[word]['count'] += data['count']
-                for sent in data['sentences']:
-                    if sent not in words[word]['sentences'] and len(words[word]['sentences']) < 5:
-                        words[word]['sentences'].append(sent)
-            grammar.update(sentence_grammar)
-    
-    print("\n  Threaded analysis complete.")
-    return words, grammar
+        for i, future in enumerate(as_completed(futures), 1):
+            sys.stdout.write(f"\r  Processing text chunks: {i}/{len(sentence_chunks)}")
+            sys.stdout.flush()
 
-def get_dictionary_priority(folder_path):
-    """Prompts the user to set the priority for dictionary files."""
+            chunk_words, chunk_grammar = future.result()
+            # Merge results from the chunk into the main collection
+            for word, data in chunk_words.items():
+                words[word]['count'] += data['count']
+                # Limit to 5 example sentences to keep file sizes reasonable
+                if len(words[word]['sentences']) < 5:
+                    new_sentences = [s for s in data['sentences'] if s not in words[word]['sentences']]
+                    words[word]['sentences'].extend(new_sentences)
+                    words[word]['sentences'] = words[word]['sentences'][:5]
+            grammar.update(chunk_grammar)
+
+    print("\n  Parallel analysis complete.")
+    return dict(words), grammar
+
+
+def get_dictionary_priority(folder_path: str) -> List[str]:
+    """Prompts the user to select and prioritize dictionary files."""
     if not os.path.exists(folder_path):
         print(f"Warning: Dictionary folder '{folder_path}' not found.")
         return []
 
-    dictionaries = [f for f in os.listdir(folder_path) if f.endswith('.zip')]
+    dictionaries = [f for f in os.listdir(folder_path) if f.endswith('.zip') or f.endswith('.json')]
     if not dictionaries:
-        print("No dictionary files found.")
+        print(f"No dictionary files found in the '{folder_path}' folder.")
         return []
 
-    print("Found the following dictionaries:")
+    print("\nFound the following dictionaries:")
     for i, name in enumerate(dictionaries):
         print(f"  [{i + 1}] {name}")
 
     while True:
         try:
-            priority_input = input(f"\nEnter the desired order (e.g., '3,1,2'): ")
+            priority_input = input(f"Enter the desired order (e.g., '2,1'), or press Enter to skip: ")
+            if not priority_input:
+                return []
             priority_indices = [int(p.strip()) - 1 for p in priority_input.split(',')]
             
-            if all(0 <= i < len(dictionaries) for i in priority_indices) and len(priority_indices) == len(dictionaries):
+            if all(0 <= i < len(dictionaries) for i in priority_indices):
                 return [dictionaries[i] for i in priority_indices]
             else:
-                print("Invalid input. Please enter a comma-separated list of numbers corresponding to the dictionaries.")
+                print("Invalid input. Please enter numbers corresponding to the dictionaries listed.")
         except (ValueError, IndexError):
-            print("Invalid input format.")
+            print("Invalid input format. Please enter comma-separated numbers (e.g., 2,1).")
 
-def load_single_dictionary_job(zip_path):
-    """A helper function to load a single dictionary from a ZIP archive."""
-    dict_name = os.path.splitext(os.path.basename(zip_path))[0]
+
+def load_single_dictionary_job(filepath: str) -> Tuple[str, Dict[str, Any]]:
+    """Loads a single dictionary file (zip or json) into memory."""
+    dict_name = os.path.splitext(os.path.basename(filepath))[0]
     dictionary = {}
-    try:
+    
+    def process_entry(entry):
         try:
-            import orjson
-            is_orjson = True
-        except ImportError:
-            import json
-            is_orjson = False
+            # Assumes a specific format, but handles failure gracefully
+            term, _, _, _, _, definition, *_ = entry
+            # Ensure definition is stored as a UTF-8 string
+            if isinstance(definition, (list, dict)):
+                return term, orjson.dumps(definition).decode('utf-8')
+            return term, definition
+        except (ValueError, TypeError):
+            # print(f"WARNING: Malformed entry in '{dict_name}': {entry}") # Uncomment for debugging
+            return None, None
 
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            for json_file in z.namelist():
-                if json_file.startswith('term_bank_') and json_file.endswith('.json'):
-                    with z.open(json_file) as f:
-                        if is_orjson:
+    try:
+        if filepath.endswith('.zip'):
+            with zipfile.ZipFile(filepath, 'r') as z:
+                for json_file in z.namelist():
+                    if json_file.startswith('term_bank_') and json_file.endswith('.json'):
+                        with z.open(json_file) as f:
                             data = orjson.loads(f.read())
-                        else:
-                            data = json.load(f)
-
-                        for entry in data:
-                            term = entry[0]
-                            definition = entry[5] if len(entry) > 5 else 'No definition found'
-                            dictionary[term] = definition
+                            for entry in data:
+                                term, definition = process_entry(entry)
+                                if term: dictionary[term] = definition
+        elif filepath.endswith('.json'):
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = orjson.loads(f.read())
+                for entry in data:
+                    term, definition = process_entry(entry)
+                    if term: dictionary[term] = definition
     except Exception as e:
-        print(f"An error occurred with dictionary '{zip_path}': {e}")
+        print(f"\nERROR: Failed to load dictionary '{filepath}': {e}")
         return dict_name, {}
+        
     return dict_name, dictionary
 
-def load_dictionaries_with_cache(folder_path, prioritized_list, cache_folder='cache'):
-    """
-    Loads dictionaries using individual cache files for each dictionary.
-    """
-    dictionaries = {}
-    if not os.path.exists(cache_folder):
-        os.makedirs(cache_folder)
 
-    zip_paths_to_load_from_source = []
-    cached_dictionaries_to_load = {}
+def load_dictionaries_with_cache(folder_path: str, prioritized_list: List[str]) -> Dict[str, Dict]:
+    """Loads dictionaries from source or cached .pkl files for speed."""
+    dictionaries = {}
+    os.makedirs(CACHE_FOLDER, exist_ok=True)
+    
+    files_to_load_from_source = []
+    
+    # First, check for cache availability and user preference
+    cached_files_found = {
+        os.path.splitext(fname)[0]: os.path.join(CACHE_FOLDER, f"{os.path.splitext(fname)[0]}.pkl")
+        for fname in prioritized_list if os.path.exists(os.path.join(CACHE_FOLDER, f"{os.path.splitext(fname)[0]}.pkl"))
+    }
+    
+    use_cache = False
+    if cached_files_found:
+        prompt = f"Cache files found for {', '.join(cached_files_found.keys())}. Use them? (y/n): "
+        if input(prompt).lower() == 'y':
+            use_cache = True
+
+    # Decide which files to load from source vs. cache
     for filename in prioritized_list:
         dict_name = os.path.splitext(filename)[0]
-        cache_file = os.path.join(cache_folder, f"{dict_name}.pkl")
-        if os.path.exists(cache_file):
-            cached_dictionaries_to_load[dict_name] = cache_file
+        if use_cache and dict_name in cached_files_found:
+            print(f"  Loading '{dict_name}' from cache...")
+            try:
+                with open(cached_files_found[dict_name], 'rb') as f:
+                    dictionaries[dict_name] = pickle.load(f)
+            except Exception as e:
+                print(f"  ERROR: Failed to load cache for '{dict_name}': {e}. Loading from source instead.")
+                files_to_load_from_source.append(os.path.join(folder_path, filename))
         else:
-            zip_paths_to_load_from_source.append(os.path.join(folder_path, filename))
+            files_to_load_from_source.append(os.path.join(folder_path, filename))
 
-    if cached_dictionaries_to_load:
-        cached_names = ', '.join(cached_dictionaries_to_load.keys())
-        use_cache = input(f"Cache files found for {cached_names}. Use cached versions? (y/n): ")
-        if use_cache.lower() == 'y':
-            for dict_name, cache_file in cached_dictionaries_to_load.items():
-                print(f"  Loading '{dict_name}' from cache...")
-                try:
-                    with open(cache_file, 'rb') as f:
-                        dictionaries[dict_name] = pickle.load(f)
-                except Exception as e:
-                    print(f"Error loading cache for '{dict_name}': {e}. Will load from source instead.")
-                    zip_paths_to_load_from_source.append(os.path.join(folder_path, f"{dict_name}.zip"))
-    
-    if zip_paths_to_load_from_source:
-        print("Loading dictionaries from source...")
-        total_dictionaries = len(zip_paths_to_load_from_source)
-        with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(load_single_dictionary_job, zip_path) for zip_path in zip_paths_to_load_from_source}
-            
-            for i, future in enumerate(as_completed(futures)):
+    # Load any remaining files from their source
+    if files_to_load_from_source:
+        print("Loading dictionaries from source files...")
+        with ProcessPoolExecutor() as executor:
+            futures = {executor.submit(load_single_dictionary_job, filepath) for filepath in files_to_load_from_source}
+            for i, future in enumerate(as_completed(futures), 1):
                 dict_name, loaded_dict = future.result()
                 dictionaries[dict_name] = loaded_dict
-                
-                sys.stdout.write(f"\r  Loading dictionary {i + 1}/{total_dictionaries}: '{dict_name}'")
+                sys.stdout.write(f"\r  Loaded {i}/{len(files_to_load_from_source)}: '{dict_name}' ({len(loaded_dict)} entries)")
                 sys.stdout.flush()
-                
-                cache_file = os.path.join(cache_folder, f"{dict_name}.pkl")
+
+                # Save the newly loaded dictionary to cache
+                cache_file = os.path.join(CACHE_FOLDER, f"{dict_name}.pkl")
                 with open(cache_file, 'wb') as f:
                     pickle.dump(loaded_dict, f)
-        print("\nAll dictionaries loaded.")
-    elif not dictionaries:
-        print("\nSkipping dictionary loading.")
-        return {}
+        print("\nDictionaries loaded and cached.")
+        
+    # Ensure the final dictionary order matches the user's priority
+    return {name: dictionaries[name] for name in [os.path.splitext(p)[0] for p in prioritized_list] if name in dictionaries}
 
-    return dictionaries
 
-def add_definitions(words, dictionaries):
-    """Adds multiple English definitions to the word data."""
+def add_definitions(words: Dict[str, Dict], dictionaries: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Adds definitions to words from the prioritized list of dictionaries."""
+    print("Adding definitions to words...")
     for word in words:
         definitions = []
+        # Iterate through dictionaries in their prioritized order
         for dict_name, dictionary in dictionaries.items():
             if word in dictionary:
+                # Combine definitions from multiple dictionaries
                 definitions.append(f"<b>{dict_name}:</b> {dictionary[word]}")
-        words[word]['definitions'] = "<br>".join(definitions)
+        words[word]['definitions'] = "".join(definitions)
     return words
 
-def interactive_filter(words):
-    """Guides the user through filtering the word list."""
+
+def interactive_filter(words: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Applies a series of user-defined filters to the word list."""
     print("\n--- Interactive Filtering ---")
-    
-    if input("Remove words without definitions? (y/n): ").lower() == 'y':
+    if not words:
+        print("  Word list is empty, nothing to filter.")
+        return {}
+
+    if input("Remove words without any definitions? (y/n): ").lower() == 'y':
         words = {w: d for w, d in words.items() if d.get('definitions')}
         print(f"  Words remaining: {len(words)}")
 
     try:
-        min_freq = int(input("Enter minimum appearance count (e.g., 3). Enter 0 for no limit: "))
+        min_freq = int(input("Enter minimum appearance count (e.g., 5, or 0 for no limit): "))
         if min_freq > 0:
             words = {w: d for w, d in words.items() if d['count'] >= min_freq}
             print(f"  Words remaining: {len(words)}")
     except ValueError:
-        print("  Invalid number. Skipping frequency filter.")
-        
+        print("  Invalid number, skipping frequency filter.")
+
     try:
         sorted_words = sorted(words.items(), key=lambda item: item[1]['count'], reverse=True)
-        top_n = int(input(f"How many of the most common words to show for exclusion? (e.g., 20, max {len(sorted_words)}): "))
+        top_n = int(input(f"Show how many top common words for manual exclusion? (e.g., 20): "))
         if top_n > 0:
             print("Top common words:")
-            for i in range(min(top_n, len(sorted_words))):
-                print(f"  - {sorted_words[i][0]} (appears {sorted_words[i][1]['count']} times)")
+            to_exclude_preview = sorted_words[:min(top_n, len(sorted_words))]
+            for word, data in to_exclude_preview:
+                print(f"  - {word} (appears {data['count']} times)")
             
-            if input("Filter out these top N most common words? (y/n): ").lower() == 'y':
-                to_remove = {w[0] for w in sorted_words[:top_n]}
+            if input("Filter out these top N words? (y/n): ").lower() == 'y':
+                to_remove = {word for word, data in to_exclude_preview}
                 words = {w: d for w, d in words.items() if w not in to_remove}
                 print(f"  Words remaining: {len(words)}")
-                
     except ValueError:
-        print("  Invalid number. Skipping common word filter.")
+        print("  Invalid number, skipping common word filter.")
 
-    manual_exclude = input("Enter any other words to exclude, separated by commas (e.g., 하다,가다): ")
+    manual_exclude = input("Enter any other words to exclude (comma-separated): ")
     if manual_exclude:
         to_remove = {w.strip() for w in manual_exclude.split(',')}
         words = {w: d for w, d in words.items() if w not in to_remove}
         print(f"  Words remaining: {len(words)}")
-
+        
     return words
 
-def generate_anki_deck(words: Dict[str, Any], filename="anki_deck.csv"):
-    """
-    Generates a CSV file for Anki, with pre-formatted sentences and definitions.
-    """
+
+def generate_anki_deck(words: Dict[str, Any], filename: str):
+    """Generates a TSV file for Anki import from the final word list."""
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f, delimiter='\t')
-        
-        # Sort words by frequency (count) in descending order
+        # Sort by frequency for the final deck
         sorted_words = sorted(words.items(), key=lambda item: item[1]['count'], reverse=True)
-        
         for word, data in sorted_words:
-            # Process sentences: format as an HTML unordered list
-            sentences_list = data.get('sentences', [])
-            formatted_sentences = '<ul>' + ''.join([f'<li>{s}</li>' for s in sentences_list]) + '</ul>'
+            formatted_sentences = '<ul>' + ''.join([f'<li>{s}</li>' for s in data.get('sentences', [])]) + '</ul>'
+            # The definition parsing is now more robust
+            formatted_definition = parse_definition(data.get('definitions', 'No definition found.'))
+            writer.writerow([word, formatted_definition, formatted_sentences, data.get('count', 0)])
 
-            # Process definition: use the new parsing function
-            raw_definition = data.get('definitions', 'No definition found.')
-            formatted_definition = parse_definition(raw_definition)
-            
-            # This is the updated line to change the output order
-            writer.writerow([
-                word,
-                formatted_definition,
-                formatted_sentences,
-                data.get('count', 0)
-            ])
+
+def process_file(file_path: str) -> Tuple[Dict, Counter]:
+    """Orchestrates the full analysis pipeline for a single file."""
+    print(f"\n--- Processing file: {os.path.basename(file_path)} ---")
+    
+    file_extension = os.path.splitext(file_path)[1].lower()
+    text = extract_text_from_epub(file_path) if file_extension == '.epub' else extract_text_from_txt(file_path)
+    
+    if not text:
+        return {}, Counter()
+
+    words, grammar = analyze_korean_text_parallel(text)
+    print(f"  Found {len(words)} unique words.")
+    
+    return words, grammar
+
 
 def main():
-    epub_files = find_epub_files()
-    if not epub_files:
-        print("Error: No .epub file found in the current directory.")
+    """Main execution function."""
+    source_files = find_source_files()
+    if not source_files:
+        print("Error: No .epub or .txt files found in '.', 'input/', or 'novels/' directories.")
         return
 
     selected_files = []
-    if len(epub_files) > 1:
-        print("Multiple EPUB files found:")
-        for i, filename in enumerate(epub_files):
-            print(f"  [{i+1}] {filename}")
+    if len(source_files) > 1:
+        print("Multiple files found:")
+        for i, filename in enumerate(source_files, 1):
+            print(f"  [{i}] {filename}")
         
-        choice = input("Enter 'all' to process all, or a comma-separated list of numbers (e.g., '1,3'): ").lower()
+        choice = input("Enter 'all' or comma-separated numbers (e.g., '1,3') to process: ").lower()
         if choice == 'all':
-            selected_files = epub_files
+            selected_files = source_files
         else:
             try:
                 indices = [int(i.strip()) - 1 for i in choice.split(',')]
-                selected_files = [epub_files[i] for i in indices if 0 <= i < len(epub_files)]
+                selected_files = [source_files[i] for i in indices if 0 <= i < len(source_files)]
             except (ValueError, IndexError):
-                print("Invalid input. Processing all files.")
-                selected_files = epub_files
+                print("Invalid input. Exiting.")
+                return
     else:
-        selected_files = epub_files
+        selected_files = source_files
 
     if not selected_files:
-        print("No files selected for processing. Exiting.")
+        print("No files selected. Exiting.")
         return
 
-    dictionaries_folder = 'Dictionaries'
-    output_folder = 'output'
-    
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    
-    prioritized_dictionaries = get_dictionary_priority(dictionaries_folder)
+    # Load dictionaries
+    prioritized_dictionaries = get_dictionary_priority(DICTIONARIES_FOLDER)
     dictionaries = {}
     if prioritized_dictionaries:
-        print("\nLoading dictionaries...")
-        dictionaries = load_dictionaries_with_cache(dictionaries_folder, prioritized_dictionaries)
+        dictionaries = load_dictionaries_with_cache(DICTIONARIES_FOLDER, prioritized_dictionaries)
 
-    all_words_combined = {}
+    all_words_combined = defaultdict(lambda: {'count': 0, 'sentences': [], 'definitions': ''})
 
-    for epub_file in selected_files:
-        print(f"\n--- Processing EPUB file: {epub_file} ---")
-        
-        base_name = os.path.splitext(epub_file)[0]
-        output_json_file = os.path.join(output_folder, f'{base_name}_word_analysis.json')
-        grammar_output_file = os.path.join(output_folder, f'{base_name}_grammar_analysis.txt')
-        anki_csv_file = os.path.join(output_folder, f'{base_name}_anki_deck.csv')
-
-        text = extract_text_from_epub(epub_file)
-
-        print("\nAnalyzing Korean text (this may take a while)...")
-        words, grammar = analyze_korean_text_threaded(text)
-        print(f"Found {len(words)} unique words.")
+    # Process each selected file
+    for file_path in selected_files:
+        words, grammar = process_file(file_path)
+        if not words:
+            continue
 
         if dictionaries:
-            print("Adding definitions to words.")
             words = add_definitions(words, dictionaries)
-
-        filtered_words = interactive_filter(words)
         
-        print("\nGenerating output files for this book...")
-        with open(output_json_file, 'w', encoding='utf-8') as f:
-            json.dump(filtered_words, f, ensure_ascii=False, indent=4)
-            
-        with open(grammar_output_file, 'w', encoding='utf-8') as f:
+        # --- Generate per-book output files ---
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        os.makedirs(JSON_FOLDER, exist_ok=True)
+        os.makedirs(GRAMMAR_FOLDER, exist_ok=True)
+        os.makedirs(ANKI_FOLDER, exist_ok=True)
+        
+        # Save JSON analysis
+        with open(os.path.join(JSON_FOLDER, f'{base_name}_word_analysis.json'), 'wb') as f:
+            f.write(orjson.dumps(words, option=orjson.OPT_INDENT_2))
+        
+        # Save grammar analysis
+        with open(os.path.join(GRAMMAR_FOLDER, f'{base_name}_grammar_analysis.txt'), 'w', encoding='utf-8') as f:
             for item, count in grammar.most_common():
                 f.write(f"{item}: {count}\n")
-                
-        generate_anki_deck(filtered_words, anki_csv_file)
         
-        for word, data in filtered_words.items():
-            if word not in all_words_combined:
-                all_words_combined[word] = data
-            else:
-                all_words_combined[word]['count'] += data['count']
-                all_words_combined[word]['sentences'].extend(data['sentences'])
+        # Generate per-book Anki deck
+        generate_anki_deck(words, os.path.join(ANKI_FOLDER, f'{base_name}_anki_deck.csv'))
+        print(f"  Outputs for '{base_name}' generated in the 'output/' directory.")
 
+        # --- Merge results for combined output ---
+        for word, data in words.items():
+            all_words_combined[word]['count'] += data['count']
+            if not all_words_combined[word]['definitions']:
+                all_words_combined[word]['definitions'] = data.get('definitions', '')
+            if len(all_words_combined[word]['sentences']) < 5:
+                new_sentences = [s for s in data['sentences'] if s not in all_words_combined[word]['sentences']]
+                all_words_combined[word]['sentences'].extend(new_sentences)
+                all_words_combined[word]['sentences'] = all_words_combined[word]['sentences'][:5]
+
+    # --- Generate combined output if multiple files were processed ---
     if len(selected_files) > 1:
-        print("\n--- Generating combined output ---")
-        combined_anki_file = os.path.join(output_folder, 'combined_anki_deck.csv')
-        generate_anki_deck(all_words_combined, combined_anki_file)
-        print(f"  - Combined Anki deck CSV saved to: {combined_anki_file}")
-    
+        print("\n--- Generating combined output for all processed files ---")
+        # Apply interactive filter to the combined set of words
+        filtered_combined_words = interactive_filter(dict(all_words_combined))
+        
+        combined_anki_file = os.path.join(ANKI_FOLDER, 'combined_anki_deck.csv')
+        generate_anki_deck(filtered_combined_words, combined_anki_file)
+        print(f"  - Combined Anki deck saved to: {combined_anki_file}")
+
     print(f"\nAnalysis complete!")
 
+
 if __name__ == '__main__':
+    # Required for multiprocessing to work correctly on some platforms (like Windows)
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
