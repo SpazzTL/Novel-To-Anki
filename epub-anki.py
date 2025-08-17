@@ -19,9 +19,10 @@ except ImportError:
     import json as orjson
 
 # --- Constants ---
-# Pre-compiled regex for speed
+# Pre-compiled regex for possible speed gain
 CLEANR = re.compile('<.*?>|&([a-z0-9]+|#[0-9]{1,6}|#x[0-9a-f]{1,6});')
 SENTENCE_SPLITTER = re.compile(r'(?<=[.?!])\s+')
+DICT_SOURCE_SPLITTER = re.compile(r'(<b>.*?<\/b>:)')
 
 # Output Directories
 DICTIONARIES_FOLDER = 'Dictionaries'
@@ -33,96 +34,95 @@ JSON_FOLDER = 'output/json_analysis'
 
 def parse_definition(definition_text: str) -> str:
     """
-    Parses a definition string, which can be in various JSON formats, and converts it to HTML.
+    Parses a raw definition string, which may contain multiple dictionary entries
+    in various formats (simple lists, complex JSON), and converts it into clean,
+    human-readable HTML.
 
     Args:
-        definition_text: The raw definition string, potentially containing JSON.
+        definition_text: The raw definition string from the 'definitions' field.
 
     Returns:
-        An HTML-formatted string representing the definition.
+        A clean HTML-formatted string summarizing the definitions.
     """
-    # Guard against empty or non-string input
     if not isinstance(definition_text, str) or not definition_text.strip():
+        return '<div class="definition-content">No definition found.</div>'
+
+    # Split the raw text by dictionary sources (e.g., "<b>krdict_v2:</b>")
+    parts = DICT_SOURCE_SPLITTER.split(definition_text)
+    if len(parts) <= 1:
         return f'<div class="definition-content">{definition_text}</div>'
 
-    html_output = '<div class="definition-content">'
-    
-    # --- Handler 1: Simple JSON list of strings ---
-    try:
-        # Check for simple list format like: ["meaning 1", "meaning 2"]
-        data = orjson.loads(definition_text)
-        if isinstance(data, list) and all(isinstance(item, str) for item in data):
-            html_output += '<ul class="definition-examples">'
-            for meaning in data:
-                html_output += f'<li>{meaning}</li>'
-            html_output += '</ul>'
-            return html_output + '</div>'
-    except (orjson.JSONDecodeError, TypeError):
-        # Not a simple JSON list, so we move on to the next handler.
-        pass
+    cleaned_definitions = []
 
-    # --- Handler 2: Complex structured JSON from dictionaries ---
-    try:
-        if definition_text.strip().startswith('['):
-            # A common issue is incorrect quotes; try to fix them before parsing.
-            json_part = definition_text.replace("'", '"').replace("`", '"')
-            data = orjson.loads(json_part)
+    # Process the parts in chunks of [source, content]
+    for i in range(1, len(parts), 2):
+        source_tag = parts[i]
+        content_str = parts[i + 1].strip()
+        
+        processed_content = ""
 
-            # Check for the expected complex structure: [{ "content": [...] }]
-            if isinstance(data, list) and len(data) > 0 and 'content' in data[0]:
-                structured_content = data[0]['content']
+        try:
+            data = orjson.loads(content_str)
+            if isinstance(data, list) and all(isinstance(item, str) for item in data):
+                processed_content = '; '.join(data)
+        except (orjson.JSONDecodeError, TypeError):
+            # If it fails, it's not a simple list, so we move to the next handler.
+            pass
+
+        # --- Handler 2: Try to parse as complex structured content ---
+        if not processed_content:
+            try:
+                # Fix common JSON issues like single quotes
+                json_part = content_str.replace("'", '"').replace("`", '"')
+                data = orjson.loads(json_part)
                 
-                # Find all meaning sections, marked by a number followed by a period (e.g., "1.")
-                meaning_sections_indices = [
-                    i for i, item in enumerate(structured_content)
-                    if isinstance(item, dict) and 'content' in item and isinstance(item.get('content'), list) and
-                       len(item['content']) > 0 and isinstance(item['content'][0], dict) and
-                       'content' in item['content'][0] and isinstance(item['content'][0].get('content'), str) and
-                       re.match(r'^\d+\.$', item['content'][0]['content'].strip())
-                ]
-
-                if meaning_sections_indices:
-                    for meaning_index in meaning_sections_indices:
-                        section = structured_content[meaning_index]
-                        section_content = section.get('content', [])
-
-                        # Extract parts of the definition based on their typical position
-                        meaning_number = section_content[0]['content'].strip() if len(section_content) > 0 and 'content' in section_content[0] else ''
-                        english_meaning = section_content[1]['content'].strip() if len(section_content) > 1 and 'content' in section_content[1] else 'No English meaning found.'
+                descriptions = []
+                
+                # This recursive function will walk the JSON tree to find description nodes
+                def find_english_descriptions(node: Any):
+                    if isinstance(node, dict):
+                        # Target nodes are divs containing an English string description
+                        is_description = (
+                            node.get('tag') == 'div' and 
+                            node.get('lang') == 'en' and 
+                            isinstance(node.get('content'), str)
+                        )
+                        if is_description:
+                            descriptions.append(node['content'])
                         
-                        description_text = ''
-                        examples_list = []
-                        # Look for description and examples within the section
-                        for sub_item in section_content:
-                            if sub_item.get('tag') == 'div' and sub_item.get('content'):
-                                description_text = sub_item['content']
-                            if sub_item.get('tag') == 'ul' and sub_item.get('content'):
-                                examples_list = [example['content'] for example in sub_item['content'] if 'content' in example]
-                        
-                        html_output += '<div class="definition-section">'
-                        html_output += f'<p class="definition-meaning"><b>Meaning {meaning_number}</b> {english_meaning}</p>'
-                        if description_text:
-                            html_output += f'<p class="definition-desc">{description_text}</p>'
-                        if examples_list:
-                            html_output += '<ul class="definition-examples">'
-                            for example in examples_list:
-                                html_output += f'<li>{example}</li>'
-                            html_output += '</ul>'
-                        html_output += '</div>'
-                    
-                    return html_output + '</div>' # Successfully parsed complex format
-    except (orjson.JSONDecodeError, IndexError, AttributeError, TypeError) as e:
-        # If parsing fails, we'll fall through to the default handler.
-        # print(f"DEBUG: Could not parse complex JSON definition. Error: {e}") # Uncomment for debugging
-        pass
+                        # Also check for numbered meanings (e.g., "1. ", "2. ")
+                        is_meaning_number = (
+                            node.get('tag') == 'span' and
+                            node.get('style', {}).get('fontWeight') == 'bold' and
+                            isinstance(node.get('content'), str) and
+                            re.match(r'^\d+\.\s*$', node.get('content'))
+                        )
+                        if is_meaning_number:
+                             descriptions.append(f"<br><b>{node['content'].strip()}</b>")
 
-    # --- Fallback Handler: Treat as plain text ---
-    # If none of the structured parsers succeed, display the raw text.
-    return f'<div class="definition-content">{definition_text}</div>'
+                        # Recurse into child nodes
+                        if 'content' in node:
+                            find_english_descriptions(node['content'])
+
+                    elif isinstance(node, list):
+                        for item in node:
+                            find_english_descriptions(item)
+
+                find_english_descriptions(data)
+                processed_content = ' '.join(descriptions).replace("<br> ", "<br>")
+
+            except (orjson.JSONDecodeError, IndexError, AttributeError, TypeError):
+                # If complex parsing fails, use the raw content as a fallback
+                processed_content = content_str # It normally fails 
+
+        if processed_content:
+            cleaned_definitions.append(f"{source_tag} {processed_content}")
+
+    return '<div class="definition-content">' + '<br>'.join(cleaned_definitions) + '</div>'
 
 
 def find_source_files() -> List[str]:
-    """Scans common directories for .epub and .txt files."""
+    """Scans directories for .epub and .txt files."""
     files = []
     for directory in ['.', 'input', 'novels']:
         if os.path.isdir(directory):
@@ -424,8 +424,8 @@ def generate_anki_deck(words: Dict[str, Any], filename: str):
         sorted_words = sorted(words.items(), key=lambda item: item[1]['count'], reverse=True)
         for word, data in sorted_words:
             formatted_sentences = '<ul>' + ''.join([f'<li>{s}</li>' for s in data.get('sentences', [])]) + '</ul>'
-            # The definition parsing is now more robust
-            formatted_definition = parse_definition(data.get('definitions', 'No definition found.'))
+            # The new, robust function is called here to clean the definition
+            formatted_definition = parse_definition(data.get('definitions', ''))
             writer.writerow([word, formatted_definition, formatted_sentences, data.get('count', 0)])
 
 
