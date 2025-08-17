@@ -2,8 +2,35 @@
 
 
 # Novel-To-Anki
-Inspects webnovels in .epub and .txt format and outputs a CSV file for Anki.
-(only supports korean for now)
+Inspects .epub and .txt files to find unique words, sentences in which they are contained, their definitions from user provided dictionaries, and generates a JSON and CSV file, with the CSV being formatted for ANKI.
+Example json output:
+``` 
+"입술": {
+    "count": 57,
+    "sentences": [
+      "눈썹, 눈 코 입술.",
+      "날카로운 눈매, 탐욕스러워 보이는 입술.",
+      "움푹 팬 눈, 핏기 없는 입술.",
+      "그저 입술을 파들파들 떨 뿐이었다.",
+      "단어들이 그녀의 입술에서 아무렇게나 쏟아져 나왔다."
+    ],
+    "definitions": "<b>krdict_v2:</b> ['lips']"
+  },
+  "천천히": {
+    "count": 80,
+    "sentences": [
+      "천천히, 꼼꼼하게.",
+      "그저 내 등을 가만히, 천천히 토닥여줄 뿐이었다.",
+      "그리고 내게 천천히 다가왔다.",
+      "이렇게까지 될 일은 없었을 거야.\" 그녀의 목소리가 천천히 커져갔다.",
+      "해가 천천히 서쪽으로 기울고, 하늘이 주황빛으로 물들기 시작할 무렵이었다."
+    ],
+    "definitions": "<b>krdict_v2:</b> ['slowly', 'slowly']"
+  } 
+```
+
+
+Only tested with korean novels, might also work for other languages.
 ---
 
 # How to use:
@@ -26,9 +53,10 @@ A folder named **cache** will be generated to load dictionaries faster.
 
 A folder named **output** will be generated to store the output.
 
-# Speed up:
-run `pip install orjson`
+## Requirements
 
+* Python 3.7+
+* * Python libraries: ebooklib, konlpy, orjson(optional)
 
 # Anki Formatting 
 A .apkg is attached with styling info
