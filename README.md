@@ -30,7 +30,7 @@ Example json output:
 ```
 
 
-Only tested with korean novels, might also work for other languages.
+Only supports Korean and Japanese for now.
 ---
 
 # How to use:
