@@ -1,7 +1,5 @@
-
-
-
 # Novel-To-Anki
+
 Inspects .epub and .txt files to find unique words, sentences in which they are contained, their definitions from user provided dictionaries, and generates a JSON and CSV file, with the CSV being formatted for ANKI.
 Example json output:
 ``` 
