@@ -56,7 +56,7 @@ A folder named **output** will be generated to store the output.
 ## Requirements
 
 * Python 3.7+
-* * Python libraries: ebooklib, konlpy, orjson(optional)
+* * Python libraries: ebooklib, konlpy, Janome orjson(optional)
 
 # Anki Formatting 
 A .apkg is attached with styling info
