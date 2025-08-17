@@ -35,7 +35,7 @@ Only supports Korean and Japanese for now.
 Place the script in a folder with the EPUB | TXT files you want to parse. Create a folder named **Dictionaries** and place zipped (yomitan!) dictionaries inside it.
 (You can also have a folder called `novels` or `input` with all txt / epubs.)
 
-[Example Dictionaries](https://github.com/Lyroxide/yomitan-ko-dic/releases)
+[Example Dictionaries](https://github.com/MarvNC/yomitan-dictionaries)
 
 **File Example:**
 
