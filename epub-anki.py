@@ -19,9 +19,10 @@ except ImportError:
     import json as orjson
 
 # --- Constants ---
-# Pre-compiled regex for possible speed gain
+# Pre-compiled regex for speed
 CLEANR = re.compile('<.*?>|&([a-z0-9]+|#[0-9]{1,6}|#x[0-9a-f]{1,6});')
-SENTENCE_SPLITTER = re.compile(r'(?<=[.?!])\s+')
+# Japanese sentence splitter is more complex, this is a basic implementation.
+SENTENCE_SPLITTER = re.compile(r'(?<=[.?!。？！])\s+')
 DICT_SOURCE_SPLITTER = re.compile(r'(<b>.*?<\/b>:)')
 
 # Output Directories
@@ -61,27 +62,24 @@ def parse_definition(definition_text: str) -> str:
         
         processed_content = ""
 
+        # --- Handler 1: Try to parse as a simple JSON list ---
         try:
             data = orjson.loads(content_str)
             if isinstance(data, list) and all(isinstance(item, str) for item in data):
                 processed_content = '; '.join(data)
         except (orjson.JSONDecodeError, TypeError):
-            # If it fails, it's not a simple list, so we move to the next handler.
             pass
 
         # --- Handler 2: Try to parse as complex structured content ---
         if not processed_content:
             try:
-                # Fix common JSON issues like single quotes
                 json_part = content_str.replace("'", '"').replace("`", '"')
                 data = orjson.loads(json_part)
                 
                 descriptions = []
                 
-                # This recursive function will walk the JSON tree to find description nodes
                 def find_english_descriptions(node: Any):
                     if isinstance(node, dict):
-                        # Target nodes are divs containing an English string description
                         is_description = (
                             node.get('tag') == 'div' and 
                             node.get('lang') == 'en' and 
@@ -90,7 +88,6 @@ def parse_definition(definition_text: str) -> str:
                         if is_description:
                             descriptions.append(node['content'])
                         
-                        # Also check for numbered meanings (e.g., "1. ", "2. ")
                         is_meaning_number = (
                             node.get('tag') == 'span' and
                             node.get('style', {}).get('fontWeight') == 'bold' and
@@ -100,7 +97,6 @@ def parse_definition(definition_text: str) -> str:
                         if is_meaning_number:
                              descriptions.append(f"<br><b>{node['content'].strip()}</b>")
 
-                        # Recurse into child nodes
                         if 'content' in node:
                             find_english_descriptions(node['content'])
 
@@ -112,8 +108,7 @@ def parse_definition(definition_text: str) -> str:
                 processed_content = ' '.join(descriptions).replace("<br> ", "<br>")
 
             except (orjson.JSONDecodeError, IndexError, AttributeError, TypeError):
-                # If complex parsing fails, use the raw content as a fallback
-                processed_content = content_str # It normally fails 
+                processed_content = content_str
 
         if processed_content:
             cleaned_definitions.append(f"{source_tag} {processed_content}")
@@ -122,7 +117,7 @@ def parse_definition(definition_text: str) -> str:
 
 
 def find_source_files() -> List[str]:
-    """Scans directories for .epub and .txt files."""
+    """Scans common directories for .epub and .txt files."""
     files = []
     for directory in ['.', 'input', 'novels']:
         if os.path.isdir(directory):
@@ -164,28 +159,27 @@ def clean_html(raw_html: str) -> str:
     return re.sub(r'\s+', ' ', cleantext).strip()
 
 
-def get_korean_sentences(text: str) -> List[str]:
+def get_sentences(text: str) -> List[str]:
     """Splits a block of text into sentences."""
     return [s.strip() for s in SENTENCE_SPLITTER.split(text) if s.strip()]
 
 
-def initialize_worker():
+# --- Language-Specific Analysis Functions ---
+
+def initialize_korean_worker():
     """Initializes the KoNLPy Okt tagger for each worker process."""
     global okt
     from konlpy.tag import Okt
     okt = Okt()
 
-
-def analyze_sentence_chunk(sentence_chunk: List[str]) -> Tuple[Dict[str, Dict], List[str]]:
-    """Analyzes a list of sentences to extract words and grammar patterns."""
+def analyze_sentence_chunk_korean(sentence_chunk: List[str]) -> Tuple[Dict[str, Dict], List[str]]:
+    """Analyzes a list of Korean sentences to extract words and grammar patterns."""
     words = defaultdict(lambda: {'count': 0, 'sentences': []})
     grammar = []
     for sentence in sentence_chunk:
         try:
-            # norm=True (normalize), stem=True (stem words to their root)
             pos_tagged = okt.pos(sentence, norm=True, stem=True)
             for word, pos in pos_tagged:
-                # Filter for meaningful parts of speech and ignore single-character words
                 if pos in ['Noun', 'Verb', 'Adjective', 'Adverb'] and len(word) > 1:
                     words[word]['count'] += 1
                     if sentence not in words[word]['sentences']:
@@ -193,37 +187,70 @@ def analyze_sentence_chunk(sentence_chunk: List[str]) -> Tuple[Dict[str, Dict], 
                 if pos not in ['Punctuation', 'Foreign']:
                     grammar.append(f"{word}/{pos}")
         except Exception as e:
-            # Log error but continue processing other sentences
             print(f"\nWARNING: KoNLPy failed to process a sentence. Error: {e}")
             pass
     return dict(words), grammar
 
+def initialize_japanese_worker():
+    """Initializes the Janome Tokenizer for each worker process."""
+    global tokenizer
+    from janome.tokenizer import Tokenizer
+    tokenizer = Tokenizer()
 
-def analyze_korean_text_parallel(text: str) -> Tuple[Dict[str, Dict], Counter]:
+def analyze_sentence_chunk_japanese(sentence_chunk: List[str]) -> Tuple[Dict[str, Dict], List[str]]:
+    """Analyzes a list of Japanese sentences to extract words and grammar patterns."""
+    words = defaultdict(lambda: {'count': 0, 'sentences': []})
+    grammar = []
+    # Relevant parts of speech for vocabulary building in Japanese
+    target_pos = ['名詞', '動詞', '形容詞', '副詞'] # Noun, Verb, Adjective, Adverb
+    for sentence in sentence_chunk:
+        try:
+            tokens = tokenizer.tokenize(sentence)
+            for token in tokens:
+                pos = token.part_of_speech.split(',')[0]
+                word = token.base_form # Use the dictionary form (lemma)
+                if pos in target_pos and len(word) > 1:
+                    words[word]['count'] += 1
+                    if sentence not in words[word]['sentences']:
+                        words[word]['sentences'].append(sentence)
+                if pos not in ['助詞', '助動詞', '記号']: # Particle, Auxiliary Verb, Symbol
+                    grammar.append(f"{token.surface}/{pos}")
+        except Exception as e:
+            print(f"\nWARNING: Janome failed to process a sentence. Error: {e}")
+            pass
+    return dict(words), grammar
+
+
+def analyze_text_parallel(text: str, language: str) -> Tuple[Dict[str, Dict], Counter]:
     """
-    Analyzes a large Korean text in parallel to extract word frequencies,
-    example sentences, and grammar patterns.
+    Analyzes a large text in parallel using the appropriate language engine.
     """
-    sentences = get_korean_sentences(text)
+    if language == 'korean':
+        initializer = initialize_korean_worker
+        analyzer = analyze_sentence_chunk_korean
+    elif language == 'japanese':
+        initializer = initialize_japanese_worker
+        analyzer = analyze_sentence_chunk_japanese
+    else:
+        raise ValueError("Unsupported language specified.")
+
+    sentences = get_sentences(text)
     words = defaultdict(lambda: {'count': 0, 'sentences': [], 'definitions': {}})
     grammar = Counter()
 
-    # Split sentences into manageable chunks for parallel processing
     chunk_size = 2000
     sentence_chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
 
-    with ProcessPoolExecutor(initializer=initialize_worker) as executor:
-        futures = {executor.submit(analyze_sentence_chunk, chunk) for chunk in sentence_chunks}
+    with ProcessPoolExecutor(initializer=initializer) as executor:
+        futures = {executor.submit(analyzer, chunk) for chunk in sentence_chunks}
         
         for i, future in enumerate(as_completed(futures), 1):
             sys.stdout.write(f"\r  Processing text chunks: {i}/{len(sentence_chunks)}")
             sys.stdout.flush()
 
             chunk_words, chunk_grammar = future.result()
-            # Merge results from the chunk into the main collection
             for word, data in chunk_words.items():
                 words[word]['count'] += data['count']
-                # Limit to 5 example sentences to keep file sizes reasonable
                 if len(words[word]['sentences']) < 5:
                     new_sentences = [s for s in data['sentences'] if s not in words[word]['sentences']]
                     words[word]['sentences'].extend(new_sentences)
@@ -271,14 +298,11 @@ def load_single_dictionary_job(filepath: str) -> Tuple[str, Dict[str, Any]]:
     
     def process_entry(entry):
         try:
-            # Assumes a specific format, but handles failure gracefully
             term, _, _, _, _, definition, *_ = entry
-            # Ensure definition is stored as a UTF-8 string
             if isinstance(definition, (list, dict)):
                 return term, orjson.dumps(definition).decode('utf-8')
             return term, definition
         except (ValueError, TypeError):
-            # print(f"WARNING: Malformed entry in '{dict_name}': {entry}") # Uncomment for debugging
             return None, None
 
     try:
@@ -311,7 +335,6 @@ def load_dictionaries_with_cache(folder_path: str, prioritized_list: List[str]) 
     
     files_to_load_from_source = []
     
-    # First, check for cache availability and user preference
     cached_files_found = {
         os.path.splitext(fname)[0]: os.path.join(CACHE_FOLDER, f"{os.path.splitext(fname)[0]}.pkl")
         for fname in prioritized_list if os.path.exists(os.path.join(CACHE_FOLDER, f"{os.path.splitext(fname)[0]}.pkl"))
@@ -323,7 +346,6 @@ def load_dictionaries_with_cache(folder_path: str, prioritized_list: List[str]) 
         if input(prompt).lower() == 'y':
             use_cache = True
 
-    # Decide which files to load from source vs. cache
     for filename in prioritized_list:
         dict_name = os.path.splitext(filename)[0]
         if use_cache and dict_name in cached_files_found:
@@ -337,7 +359,6 @@ def load_dictionaries_with_cache(folder_path: str, prioritized_list: List[str]) 
         else:
             files_to_load_from_source.append(os.path.join(folder_path, filename))
 
-    # Load any remaining files from their source
     if files_to_load_from_source:
         print("Loading dictionaries from source files...")
         with ProcessPoolExecutor() as executor:
@@ -348,13 +369,11 @@ def load_dictionaries_with_cache(folder_path: str, prioritized_list: List[str]) 
                 sys.stdout.write(f"\r  Loaded {i}/{len(files_to_load_from_source)}: '{dict_name}' ({len(loaded_dict)} entries)")
                 sys.stdout.flush()
 
-                # Save the newly loaded dictionary to cache
                 cache_file = os.path.join(CACHE_FOLDER, f"{dict_name}.pkl")
                 with open(cache_file, 'wb') as f:
                     pickle.dump(loaded_dict, f)
         print("\nDictionaries loaded and cached.")
         
-    # Ensure the final dictionary order matches the user's priority
     return {name: dictionaries[name] for name in [os.path.splitext(p)[0] for p in prioritized_list] if name in dictionaries}
 
 
@@ -363,10 +382,8 @@ def add_definitions(words: Dict[str, Dict], dictionaries: Dict[str, Dict]) -> Di
     print("Adding definitions to words...")
     for word in words:
         definitions = []
-        # Iterate through dictionaries in their prioritized order
         for dict_name, dictionary in dictionaries.items():
             if word in dictionary:
-                # Combine definitions from multiple dictionaries
                 definitions.append(f"<b>{dict_name}:</b> {dictionary[word]}")
         words[word]['definitions'] = "".join(definitions)
     return words
@@ -420,16 +437,14 @@ def generate_anki_deck(words: Dict[str, Any], filename: str):
     """Generates a TSV file for Anki import from the final word list."""
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f, delimiter='\t')
-        # Sort by frequency for the final deck
         sorted_words = sorted(words.items(), key=lambda item: item[1]['count'], reverse=True)
         for word, data in sorted_words:
             formatted_sentences = '<ul>' + ''.join([f'<li>{s}</li>' for s in data.get('sentences', [])]) + '</ul>'
-            # The new, robust function is called here to clean the definition
             formatted_definition = parse_definition(data.get('definitions', ''))
             writer.writerow([word, formatted_definition, formatted_sentences, data.get('count', 0)])
 
 
-def process_file(file_path: str) -> Tuple[Dict, Counter]:
+def process_file(file_path: str, language: str) -> Tuple[Dict, Counter]:
     """Orchestrates the full analysis pipeline for a single file."""
     print(f"\n--- Processing file: {os.path.basename(file_path)} ---")
     
@@ -439,7 +454,7 @@ def process_file(file_path: str) -> Tuple[Dict, Counter]:
     if not text:
         return {}, Counter()
 
-    words, grammar = analyze_korean_text_parallel(text)
+    words, grammar = analyze_text_parallel(text, language)
     print(f"  Found {len(words)} unique words.")
     
     return words, grammar
@@ -447,6 +462,20 @@ def process_file(file_path: str) -> Tuple[Dict, Counter]:
 
 def main():
     """Main execution function."""
+    # --- Language Selection ---
+    while True:
+        lang_choice = input("Select language (1 for Korean, 2 for Japanese): ").strip()
+        if lang_choice == '1':
+            language = 'korean'
+            break
+        elif lang_choice == '2':
+            language = 'japanese'
+            break
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+    
+    print(f"Language set to: {language.capitalize()}")
+
     source_files = find_source_files()
     if not source_files:
         print("Error: No .epub or .txt files found in '.', 'input/', or 'novels/' directories.")
@@ -454,7 +483,7 @@ def main():
 
     selected_files = []
     if len(source_files) > 1:
-        print("Multiple files found:")
+        print("\nMultiple files found:")
         for i, filename in enumerate(source_files, 1):
             print(f"  [{i}] {filename}")
         
@@ -483,35 +512,29 @@ def main():
 
     all_words_combined = defaultdict(lambda: {'count': 0, 'sentences': [], 'definitions': ''})
 
-    # Process each selected file
     for file_path in selected_files:
-        words, grammar = process_file(file_path)
+        words, grammar = process_file(file_path, language)
         if not words:
             continue
 
         if dictionaries:
             words = add_definitions(words, dictionaries)
         
-        # --- Generate per-book output files ---
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         os.makedirs(JSON_FOLDER, exist_ok=True)
         os.makedirs(GRAMMAR_FOLDER, exist_ok=True)
         os.makedirs(ANKI_FOLDER, exist_ok=True)
         
-        # Save JSON analysis
         with open(os.path.join(JSON_FOLDER, f'{base_name}_word_analysis.json'), 'wb') as f:
             f.write(orjson.dumps(words, option=orjson.OPT_INDENT_2))
         
-        # Save grammar analysis
         with open(os.path.join(GRAMMAR_FOLDER, f'{base_name}_grammar_analysis.txt'), 'w', encoding='utf-8') as f:
             for item, count in grammar.most_common():
                 f.write(f"{item}: {count}\n")
         
-        # Generate per-book Anki deck
         generate_anki_deck(words, os.path.join(ANKI_FOLDER, f'{base_name}_anki_deck.csv'))
         print(f"  Outputs for '{base_name}' generated in the 'output/' directory.")
 
-        # --- Merge results for combined output ---
         for word, data in words.items():
             all_words_combined[word]['count'] += data['count']
             if not all_words_combined[word]['definitions']:
@@ -521,10 +544,8 @@ def main():
                 all_words_combined[word]['sentences'].extend(new_sentences)
                 all_words_combined[word]['sentences'] = all_words_combined[word]['sentences'][:5]
 
-    # --- Generate combined output if multiple files were processed ---
     if len(selected_files) > 1:
         print("\n--- Generating combined output for all processed files ---")
-        # Apply interactive filter to the combined set of words
         filtered_combined_words = interactive_filter(dict(all_words_combined))
         
         combined_anki_file = os.path.join(ANKI_FOLDER, 'combined_anki_deck.csv')
@@ -535,7 +556,6 @@ def main():
 
 
 if __name__ == '__main__':
-    # Required for multiprocessing to work correctly on some platforms (like Windows)
     import multiprocessing
     multiprocessing.freeze_support()
     main()
