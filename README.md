@@ -1,8 +1,13 @@
 # Novel-To-Anki
 ## Only supports Korean and Japanese for now.
 
-Inspects .epub and .txt files to find unique words, sentences in which they are contained, their definitions from user provided dictionaries, and generates a JSON and CSV file, with the CSV being formatted for ANKI.
+# Example Output 
+<img width="983" height="858" alt="image" src="https://github.com/user-attachments/assets/e5a01906-6183-4823-b22c-6fc8400a936f" />
+<br> <br>
+Inspects .epub and .txt files to find unique words, sentences in which they are contained, their definitions from user provided dictionaries, and generates a JSON and CSV file, with the CSV being formatted for ANKI. <br>
+(Csv will need to be cleaned, as this could vary depending on dictionary, I have left this up to the user. There is an attached KO-EN-DictionaryClean.py that may work or serve as an example.) <br>
 Example json output:
+
 ``` 
 "입술": {
     "count": 57,
@@ -60,4 +65,5 @@ A folder named **output** will be generated to store the output.
 # Anki Formatting 
 A .apkg is attached with styling info
 <img width="899" height="730" alt="image" src="https://github.com/user-attachments/assets/1f272170-8d6f-42a0-aeb7-ac730db7ce54" />
-<img width="930" height="488" alt="image" src="https://github.com/user-attachments/assets/8e62c5c4-f63b-4757-915b-d8b92b730207" />
+<img width="983" height="858" alt="image" src="https://github.com/user-attachments/assets/3c1c0937-6d69-40d1-aae9-b1294dd38296" />
+
