@@ -1,5 +1,5 @@
 # Novel-To-Anki
-## Only supports Korean and Japanese for now.
+## Only supports Korean, Japanese and Spanish for now. (JP and SP not tested extensively.) 
 
 # Example Output 
 <img width="960" height="741" alt="image" src="https://github.com/user-attachments/assets/62bbdec2-0c61-49a8-9189-274f3a6b8082" />
