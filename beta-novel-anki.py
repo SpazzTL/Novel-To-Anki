@@ -1,6 +1,7 @@
 import csv
 import os
 import pickle
+import random
 import re
 import sys
 import time
@@ -21,17 +22,18 @@ except ImportError:
 
 # --- Constants ---
 CLEANR = re.compile('<.*?>|&([a-z0-9]+|#[0-9]{1,6}|#x[0-9a-f]{1,6});')
-SENTENCE_SPLITTER = re.compile(r'(?<=[.?!。？！])\s+')
+SENTENCE_SPLITTER = re.compile(r'(?<=[.?!。？！\]\)』）])\s+')
 DICT_SOURCE_SPLITTER = re.compile(r'(<b>.*?<\/b>:)')
 
-# --- i+1 and Sentence Configuration ---
-# The maximum number of "unknown" vocabulary words allowed in an example sentence.
-I_PLUS_ONE_THRESHOLD = 3
-# The maximum number of example sentences to find for each word.
-NUM_EXAMPLE_SENTENCES = 5
-# The minimum number of meaningful words a sentence must have to be included.
-MIN_SENTENCE_WORD_COUNT = 5
 
+
+# Change without cache refresh
+I_PLUS_ONE_THRESHOLD = 0
+# Change without cache refresh
+NUM_EXAMPLE_SENTENCES = 7
+# recache
+MIN_SENTENCE_WORD_COUNT = 3
+MAX_SENTENCE_LENGTH = 60
 
 # Output Directories
 DICTIONARIES_FOLDER = 'Dictionaries'
@@ -39,6 +41,7 @@ CACHE_FOLDER = 'cache'
 ANKI_FOLDER = 'output/anki_csv'
 GRAMMAR_FOLDER = 'output/grammar_analysis'
 JSON_FOLDER = 'output/json_analysis'
+NOVEL_CACHE_FOLDER = os.path.join(CACHE_FOLDER, 'novels')
 
 # --- Definition Parsing ---
 def parse_json_to_html(json_data: Any) -> str:
@@ -179,7 +182,8 @@ def analyze_sentence_chunk_korean(sentence_chunk: List[Dict]) -> Tuple[Dict[str,
             pos_tagged_stemmed = okt.pos(sentence, norm=True, stem=True)
 
             meaningful_tokens = [word for word, pos in pos_tagged_stemmed if pos not in ['Punctuation', 'Foreign', 'Josa', 'Suffix']]
-            if len(meaningful_tokens) < MIN_SENTENCE_WORD_COUNT:
+            # --- MODIFIED LINE ---
+            if not (MIN_SENTENCE_WORD_COUNT <= len(meaningful_tokens) <= MAX_SENTENCE_LENGTH):
                 continue
 
             current_sentence_tokens = []
@@ -216,6 +220,7 @@ def initialize_japanese_worker():
     tokenizer = Tokenizer()
 
 def analyze_sentence_chunk_japanese(sentence_chunk: List[Dict]) -> Tuple[Dict[str, int], List[str], List[Dict]]:
+
     """Analyzes a list of Japanese sentences to extract words, grammar, and tokens."""
     words = Counter()
     grammar = []
@@ -229,7 +234,8 @@ def analyze_sentence_chunk_japanese(sentence_chunk: List[Dict]) -> Tuple[Dict[st
             tokens = list(tokenizer.tokenize(sentence))
             
             meaningful_tokens = [t for t in tokens if t.part_of_speech.split(',')[0] not in ignore_pos_for_count]
-            if len(meaningful_tokens) < MIN_SENTENCE_WORD_COUNT:
+            # --- MODIFIED LINE ---
+            if not (MIN_SENTENCE_WORD_COUNT <= len(meaningful_tokens) <= MAX_SENTENCE_LENGTH):
                 continue
 
             current_sentence_tokens = []
@@ -252,20 +258,6 @@ def analyze_sentence_chunk_japanese(sentence_chunk: List[Dict]) -> Tuple[Dict[st
             print(f"\nWARNING: Janome failed to process a sentence. Error: {e}")
     return dict(words), grammar, tokenized_sentences
 
-def initialize_spanish_worker():
-    """
-    Initializes the spaCy model for each worker process.
-    Requires: pip install spacy && python -m spacy download es_core_news_sm
-    """
-    global nlp
-    import spacy
-    try:
-        nlp = spacy.load("es_core_news_sm")
-    except OSError:
-        print("\nERROR: Spanish model not found. Please run 'python -m spacy download es_core_news_sm'")
-        sys.exit(1)
-
-
 def analyze_sentence_chunk_spanish(sentence_chunk: List[Dict]) -> Tuple[Dict[str, int], List[str], List[Dict]]:
     """Analyzes a list of Spanish sentences using spaCy."""
     words = Counter()
@@ -279,7 +271,8 @@ def analyze_sentence_chunk_spanish(sentence_chunk: List[Dict]) -> Tuple[Dict[str
             doc = nlp(sentence)
 
             meaningful_tokens = [token for token in doc if not token.is_punct and not token.is_space]
-            if len(meaningful_tokens) < MIN_SENTENCE_WORD_COUNT:
+            # --- MODIFIED LINE ---
+            if not (MIN_SENTENCE_WORD_COUNT <= len(meaningful_tokens) <= MAX_SENTENCE_LENGTH):
                 continue
             
             current_sentence_tokens = []
@@ -304,7 +297,6 @@ def analyze_sentence_chunk_spanish(sentence_chunk: List[Dict]) -> Tuple[Dict[str
             print(f"\nWARNING: spaCy failed to process a sentence. Error: {e}")
             
     return dict(words), grammar, tokenized_sentences
-
 
 def analyze_text_parallel(text: str, language: str, source_file: str) -> Tuple[Dict[str, int], Counter, List[Dict]]:
     """Analyzes a large text in parallel, returning word counts, grammar, and tokenized sentences."""
@@ -341,10 +333,10 @@ def analyze_text_parallel(text: str, language: str, source_file: str) -> Tuple[D
     return dict(word_counts), grammar, all_tokenized_sentences
 
 
-# --- i+1 Sentence Finding Logic ---
 def find_i_plus_one_sentences(vocabulary_list: List[str], all_sentences: List[Dict]) -> Dict[str, List[Dict]]:
     """
-    Finds example sentences using a more intelligent sequential i+1 logic.
+    Finds example sentences using an intelligent, iterative i+1 logic
+    with randomness to promote source diversity.
     """
     print("\n--- Pre-processing all sentences for faster lookups ---")
     word_to_sentences = defaultdict(list)
@@ -352,47 +344,63 @@ def find_i_plus_one_sentences(vocabulary_list: List[str], all_sentences: List[Di
         words_in_sentence = set(sentence_data["tokens"])
         for token in words_in_sentence:
             word_to_sentences[token].append(sentence_data)
-            
-    print("\n--- Analyzing vocabulary with smarter sequential i+1 logic ---")
+
+    print("\n--- Analyzing vocabulary with iterative i+1 logic ---")
     final_results = defaultdict(list)
     total_vocab_set = set(vocabulary_list)
     known_words = set()
 
+    # Define a maximum threshold to prevent long-running, low-quality searches
+    MAX_THRESHOLD = I_PLUS_ONE_THRESHOLD + 4
+
     for current_word in tqdm(vocabulary_list, desc="Analyzing vocabulary"):
+        # Shuffle sentences to ensure randomness from different sources (novels)
         relevant_sentences = word_to_sentences.get(current_word, [])
-        
-        for sentence_data in relevant_sentences:
-            words_in_sentence_set = set(sentence_data["tokens"])
+        random.shuffle(relevant_sentences)
 
-            if current_word in words_in_sentence_set:
-                # --- NEW LOGIC ---
-                # An "unknown" word is now defined as a word that is ALSO in our total vocab list
-                # but has not yet been processed (i.e., it's a less frequent word).
-                # This prevents penalizing sentences for containing random words not on our study list.
-                future_vocab_words = words_in_sentence_set.intersection(total_vocab_set - known_words - {current_word})
-                i_plus_one_score = len(future_vocab_words)
+        found_sentences_for_word = []
+        processed_sentence_text = set()
 
-                if i_plus_one_score <= I_PLUS_ONE_THRESHOLD:
-                    final_results[current_word].append({
-                        "sentence": sentence_data["sentence"],
-                        "i_plus_one_score": i_plus_one_score,
-                        "source": sentence_data["source"]
-                    })
-        
-        # After processing all sentences for the current word, add it to the set of known words.
-        known_words.add(current_word)
-        
-    print("\n--- Sorting and selecting the best sentences for each word ---")
-    sorted_results = {}
-    for word in vocabulary_list:
-        if word in final_results:
-            # Sort the found sentences by their score (best score is 0, then 1, etc.)
-            sorted_sentences = sorted(final_results[word], key=lambda x: x['i_plus_one_score'])
-            # Limit the number of sentences to the configured amount
-            sorted_results[word] = sorted_sentences[:NUM_EXAMPLE_SENTENCES]
+        # Start with the best possible score (0 unknowns) and raise the threshold if needed
+        current_threshold = 0
+        while len(found_sentences_for_word) < NUM_EXAMPLE_SENTENCES and current_threshold <= MAX_THRESHOLD:
+            for sentence_data in relevant_sentences:
+                sentence_text = sentence_data['sentence']
+                
+                # Avoid re-processing the same sentence
+                if sentence_text in processed_sentence_text:
+                    continue
+
+                words_in_sentence_set = set(sentence_data["tokens"])
+
+                if current_word in words_in_sentence_set:
+                    future_vocab_words = words_in_sentence_set.intersection(total_vocab_set - known_words - {current_word})
+                    i_plus_one_score = len(future_vocab_words)
+
+                    if i_plus_one_score == current_threshold:
+                        found_sentences_for_word.append({
+                            "sentence": sentence_text,
+                            "i_plus_one_score": i_plus_one_score,
+                            "source": sentence_data["source"]
+                        })
+                        processed_sentence_text.add(sentence_text)
+
+                # Stop if we've found enough sentences for this word
+                if len(found_sentences_for_word) >= NUM_EXAMPLE_SENTENCES:
+                    break
             
-    return sorted_results
+            # If we haven't found enough, increase the threshold for the next pass
+            current_threshold += 1
 
+        if found_sentences_for_word:
+            final_results[current_word] = found_sentences_for_word
+
+        # After processing, add the current word to the set of known words for the next iteration.
+        known_words.add(current_word)
+
+    # The final sorting and limiting step is now handled within the loop,
+    # so we can directly return the populated dictionary.
+    return dict(final_results)
 
 # --- Parallel Dictionary Loading & Definition Adding ---
 def get_dictionary_priority(folder_path: str) -> List[str]:
@@ -721,17 +729,46 @@ def main():
         print("No files selected. Exiting.")
         return
 
+    # --- NEW: Create cache directory for novels ---
+    os.makedirs(NOVEL_CACHE_FOLDER, exist_ok=True)
+    
     all_words_combined = Counter()
     all_tokenized_sentences_combined = []
-    
-    for file_path in selected_files:
+    total_files = len(selected_files) # For progress indicator
+
+    for i, file_path in enumerate(selected_files):
+        base_name = os.path.basename(file_path)
+        
+        # --- NEW: Progress Indicator ---
+        print(f"\n--- Processing file: {base_name} ---")
+        print(f"   Novel {i + 1}/{total_files}")
+
         try:
-            word_counts, _, tokenized_sentences = process_file_for_data(file_path, language)
+            # --- NEW: Caching Logic ---
+            cache_file_name = f"{base_name}.pkl"
+            cache_path = os.path.join(NOVEL_CACHE_FOLDER, cache_file_name)
+            
+            is_stale = not os.path.exists(cache_path) or os.path.getmtime(file_path) > os.path.getmtime(cache_path)
+
+            if not is_stale:
+                print("  Loading from cache...")
+                with open(cache_path, 'rb') as f:
+                    # The grammar object is not used later, so we load it as '_'
+                    word_counts, _, tokenized_sentences = pickle.load(f)
+                print(f"  Found {len(word_counts)} unique words and {len(tokenized_sentences)} valid sentences in cache.")
+            else:
+                word_counts, grammar, tokenized_sentences = process_file_for_data(file_path, language)
+                
+                print("  Saving processed data to cache...")
+                with open(cache_path, 'wb') as f:
+                    pickle.dump((word_counts, grammar, tokenized_sentences), f)
+
             all_words_combined.update(word_counts)
             all_tokenized_sentences_combined.extend(tokenized_sentences)
+
         except Exception as e:
             print(f"\n--- !!! ---")
-            print(f"ERROR: An unexpected error occurred while processing '{os.path.basename(file_path)}'.")
+            print(f"ERROR: An unexpected error occurred while processing '{base_name}'.")
             print(f"The error was: {e}")
             print("The script will attempt to continue with the next file.")
             print(f"--- !!! ---\n")
@@ -787,7 +824,6 @@ def main():
     print(f"  - Combined Anki deck with i+1 sentences saved to: {combined_anki_file}")
 
     print(f"\nAnalysis complete!")
-
 
 if __name__ == '__main__':
     import multiprocessing
